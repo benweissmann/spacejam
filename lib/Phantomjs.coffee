@@ -3,52 +3,106 @@ expect = require('chai').expect
 ChildProcess = require './ChildProcess'
 EventEmitter = require('events').EventEmitter
 path = require 'path'
-phantomjs = require 'phantomjs-prebuilt'
+webdriverio = require 'webdriverio'
+url = require 'url'
 
 DEFAULT_PATH = process.env.PATH
 
+SELENIUM_REMOTE_URL = url.parse(process.env.SELENIUM_REMOTE_URL)
+SELENIUM_HOSTNAME = SELENIUM_REMOTE_URL.hostname
+SELENIUM_PORT = SELENIUM_REMOTE_URL.port
+SELENIUM_PATH = SELENIUM_REMOTE_URL.path
 
 class Phantomjs extends EventEmitter
 
-  childProcess: null
+  browser: null
+  intervals: null
 
   run: (url, options = '--load-images=no --ssl-protocol=TLSv1', script = "phantomjs-test-in-console.js", pipeClass = undefined, pipeClassOptions = undefined, useSystemPhantomjs = false)=>
     log.debug "Phantomjs.run()", arguments
-    expect(@childProcess,"ChildProcess is already running").to.be.null
-    expect(url, "Invalid url").to.be.a 'string'
-    expect(options, "Invalid options").to.be.a 'string'
-    expect(script, "Invalid script").to.be.a 'string'
-    expect(pipeClass, "Invalid pipeClass").to.be.a 'function' if pipeClass?
-    expect(pipeClassOptions, "Invalid pipeClassOptions").to.be.an 'object' if pipeClassOptions?
-    expect(useSystemPhantomjs, "Invalid useSystemPhantomjs").to.be.a 'boolean'
+    expect(@browser,"Browser is already connected").to.be.null
+    expect(@intervals,"Polling interval is already running").to.be.null
 
-    env = _.extend process.env, {ROOT_URL: url}
+    @intervals = []
 
-    log.debug("script=#{__dirname}/#{script}")
-    spawnArgs = options.split(' ')
-    spawnArgs.push(script)
-    log.debug 'spawnArgs:', spawnArgs
-    spawnOptions =
-      cwd: __dirname
-      detached: false
-      env: env
-    log.debug 'spawnOptions:', spawnOptions
+    @browser = webdriverio.remote
+      host: SELENIUM_HOSTNAME
+      port: SELENIUM_PORT
+      path: SELENIUM_PATH
+      desiredCapabilities:
+          browserName: "chrome"
 
-    # Add phantomjs NPM package bin to PATH unless --use-system-phantomjs is passed
-    if useSystemPhantomjs
-      process.env.PATH = DEFAULT_PATH
-    else
-      process.env.PATH = path.dirname(phantomjs.path) + ':' + DEFAULT_PATH
+    @browser
+      .init()
+      .url(url)
 
-    @childProcess = new ChildProcess()
-    @childProcess.spawn("phantomjs", spawnArgs, spawnOptions, pipeClass, pipeClassOptions)
+    # watch logs
+    logInterval = setInterval () =>
+      @browser
+        .log("browser")
+        .then (result) =>
+          result.value.forEach (entry) =>
+            if entry.message
+              # sometimes console-runner emit enourmous and useless blobs
+              # of json
+              if (entry.message[0] == '{') && entry.message.match(/"url":"http:\/\/localhost:\d+\/packages\/practicalmeteor_mocha-console-runner\.js/)
+                return
 
-    @childProcess.child.on "exit", (code, signal) =>
-      @emit "exit", code, signal
+              # clean up really long console runner preamble
+              message = entry.message.replace(/https?:\/\/localhost(:\d+)?\/packages\/([a-zA-Z0-9\-_]+)\.js(\?hash=\w+)?/, '[$2]')
 
-  kill: (signal = "SIGTERM")->
+              console.log(message)
+    , 500
+    @intervals.push(logInterval)
+
+    # watch for completion
+    completionInterval = setInterval () =>
+      @browser
+        .execute () =>
+          result =
+            done: false
+            TEST_STATUS: window.TEST_STATUS
+            DONE: window.DONE
+            FAILURES: window.FAILURES
+          if (typeof TEST_STATUS != "undefined") && (TEST_STATUS != null)
+            result.done = TEST_STATUS.DONE;
+
+          if (typeof DONE != "undefined") && (DONE != null)
+            result.done = DONE;
+
+
+          if result.done
+            failures = false
+            if (typeof TEST_STATUS != "undefined") && (TEST_STATUS != null)
+              failures = TEST_STATUS.FAILURES;
+
+            if (typeof FAILURES != "undefined") && (FAILURES != null)
+              failures = FAILURES;
+
+
+            result.code = if failures
+              2
+            else
+              0
+
+          result
+
+        .then (response) =>
+          result = response.value
+          if result.done
+            console.log("Got completion result", result)
+            @kill()
+            @emit "exit", result.code, ''
+          else
+            console.log("No completion result yet", result)
+    , 500
+    @intervals.push(completionInterval)
+
+
+  kill: (signal = "SIGTERM")=>
     log.debug "Phantomjs.kill()"
-    @childProcess?.kill(signal)
+    @intervals.forEach (interval) =>
+      clearInterval(interval)
 
 
 module.exports = Phantomjs
